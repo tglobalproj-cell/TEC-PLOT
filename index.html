@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TEC Module — Live Trend</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/luxon/3.4.4/luxon.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-adapter-luxon/1.3.1/chartjs-adapter-luxon.umd.min.js"></script>
+<style>
+  :root{
+    --bg:#0b0f14;
+    --panel:#121820;
+    --grid:#1e2732;
+    --ink:#d7e0e8;
+    --dim:#6b7885;
+    --accent:#ff8a3d;
+    --ok:#39d98a;
+    --warn:#ff5c5c;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  *{ box-sizing:border-box; }
+  html,body{
+    margin:0; height:100%;
+    background:var(--bg); color:var(--ink);
+    font-family: var(--mono);
+  }
+  .wrap{
+    display:flex; flex-direction:column; height:100%;
+  }
+  header{
+    display:flex; align-items:center; gap:16px;
+    padding:14px 20px; border-bottom:1px solid var(--grid);
+    background:var(--panel);
+  }
+  header h1{
+    font-size:14px; font-weight:600; letter-spacing:.06em;
+    text-transform:uppercase; color:var(--ink); margin:0;
+    white-space:nowrap;
+  }
+  header h1 span{ color:var(--accent); }
+  .status{
+    display:flex; align-items:center; gap:6px;
+    font-size:12px; color:var(--dim);
+  }
+  .dot{
+    width:8px; height:8px; border-radius:50%;
+    background:var(--warn); flex:none;
+  }
+  .dot.live{ background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  .spacer{ flex:1; }
+  button{
+    font-family:var(--mono); font-size:12px; letter-spacing:.04em;
+    text-transform:uppercase; padding:8px 14px;
+    background:transparent; color:var(--ink);
+    border:1px solid var(--grid); border-radius:3px;
+    cursor:pointer;
+  }
+  button:hover{ border-color:var(--accent); color:var(--accent); }
+  button:disabled{ opacity:.35; cursor:default; }
+  button:disabled:hover{ border-color:var(--grid); color:var(--ink); }
+  select{
+    font-family:var(--mono); font-size:12px;
+    background:var(--bg); color:var(--ink);
+    border:1px solid var(--grid); border-radius:3px; padding:7px 8px;
+  }
+  main{
+    flex:1; padding:18px 20px; min-height:0;
+    display:flex; flex-direction:column; gap:14px;
+  }
+  .readout{
+    display:grid; grid-template-columns:repeat(8,1fr); gap:1px;
+    background:var(--grid); border:1px solid var(--grid); border-radius:4px;
+    overflow:hidden;
+  }
+  .cell{
+    background:var(--panel); padding:10px 12px;
+  }
+  .cell .lbl{ font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:.06em; }
+  .cell .val{ font-size:18px; margin-top:4px; }
+  .chart-holder{
+    flex:1; min-height:0; background:var(--panel);
+    border:1px solid var(--grid); border-radius:4px; padding:12px;
+  }
+  #chart{ width:100%; height:100%; }
+  .hint{
+    font-size:11px; color:var(--dim); line-height:1.6;
+  }
+  .hint code{ color:var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>TEC MODULE <span>· LIVE TREND</span></h1>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">Not connected</span></div>
+    <div class="spacer"></div>
+    <select id="baud">
+      <option value="115200" selected>115200</option>
+      <option value="57600">57600</option>
+      <option value="9600">9600</option>
+    </select>
+    <button id="connectBtn">Connect</button>
+    <button id="clearBtn" disabled>Clear</button>
+  </header>
+  <main>
+    <div class="readout" id="readout"></div>
+    <div class="chart-holder"><canvas id="chart"></canvas></div>
+    <div class="hint">
+      Window is fixed to the last <b>60 minutes</b> with a gridline every <b>5 minutes</b>; it scrolls forward as new data arrives.
+      Works in Chrome / Edge only. Close the Arduino Serial Monitor or Plotter first — only one program can hold the port at a time.
+      Expects lines like <code>Amb:24.50,Out:23.10,Cold:12.00,Hot:31.20,dT:1.40,ColdPWM:65,InPWM:100,OutPWM:100</code>.
+    </div>
+  </main>
+</div>
+
+<script>
+const WINDOW_MS = 60 * 60 * 1000;      // 1 hour rolling window
+const TICK_MS   = 5 * 60 * 1000;       // 5 minute gridlines
+const MIN_SAMPLE_GAP_MS = 3000;        // throttle plotted points to keep dataset light over an hour
+
+const SERIES = [
+  { key: 'Amb',      color: '#6fb8ff', axis: 'y'  },
+  { key: 'Out',      color: '#ffd166', axis: 'y'  },
+  { key: 'Cold',     color: '#39d98a', axis: 'y'  },
+  { key: 'Hot',      color: '#ff5c5c', axis: 'y'  },
+  { key: 'dT',       color: '#c084fc', axis: 'y'  },
+  { key: 'ColdPWM',  color: '#8891a0', axis: 'y1' },
+  { key: 'InPWM',    color: '#5b6673', axis: 'y1' },
+  { key: 'OutPWM',   color: '#3d4550', axis: 'y1' },
+];
+
+const readout = document.getElementById('readout');
+SERIES.forEach(s => {
+  const cell = document.createElement('div');
+  cell.className = 'cell';
+  cell.innerHTML = `<div class="lbl">${s.key}</div><div class="val" id="val-${s.key}">--</div>`;
+  readout.appendChild(cell);
+});
+
+const ctx = document.getElementById('chart').getContext('2d');
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: {
+    datasets: SERIES.map(s => ({
+      label: s.key,
+      borderColor: s.color,
+      backgroundColor: s.color,
+      yAxisID: s.axis,
+      data: [],
+      pointRadius: 0,
+      borderWidth: 1.75,
+      tension: 0.15,
+    }))
+  },
+  options: {
+    animation: false,
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'nearest', axis: 'x', intersect: false },
+    scales: {
+      x: {
+        type: 'time',
+        time: { unit: 'minute', stepSize: 5, tooltipFormat: 'HH:mm:ss' },
+        ticks: { color: '#6b7885', maxRotation: 0, autoSkip: false, font: { family: 'monospace', size: 10 } },
+        grid: { color: '#1e2732' },
+        min: Date.now() - WINDOW_MS,
+        max: Date.now(),
+      },
+      y: {
+        position: 'left',
+        title: { display: true, text: '°C', color: '#6b7885', font: { family: 'monospace', size: 10 } },
+        ticks: { color: '#6b7885', font: { family: 'monospace', size: 10 } },
+        grid: { color: '#1e2732' },
+      },
+      y1: {
+        position: 'right',
+        title: { display: true, text: 'PWM %', color: '#6b7885', font: { family: 'monospace', size: 10 } },
+        ticks: { color: '#6b7885', font: { family: 'monospace', size: 10 } },
+        grid: { display: false },
+        min: 0, max: 100,
+      }
+    },
+    plugins: {
+      legend: { labels: { color: '#d7e0e8', font: { family: 'monospace', size: 11 }, boxWidth: 12 } },
+      tooltip: { titleFont: { family: 'monospace' }, bodyFont: { family: 'monospace' } }
+    }
+  }
+});
+
+let lastPlotMs = 0;
+
+function pruneOld() {
+  const cutoff = Date.now() - WINDOW_MS - TICK_MS; // small buffer past the window
+  chart.data.datasets.forEach(ds => {
+    while (ds.data.length && ds.data[0].x < cutoff) ds.data.shift();
+  });
+}
+
+function ingestLine(line) {
+  line = line.trim();
+  if (!line || !line.includes(':')) return;
+
+  const now = Date.now();
+  const parts = line.split(',');
+  const values = {};
+  for (const p of parts) {
+    const idx = p.indexOf(':');
+    if (idx === -1) continue;
+    const key = p.slice(0, idx).trim();
+    const num = parseFloat(p.slice(idx + 1));
+    if (!isNaN(num)) values[key] = num;
+  }
+  if (Object.keys(values).length === 0) return;
+
+  // readout updates every line (cheap), chart points throttled
+  SERIES.forEach(s => {
+    if (values[s.key] !== undefined) {
+      const el = document.getElementById('val-' + s.key);
+      if (el) el.textContent = values[s.key].toFixed(2);
+    }
+  });
+
+  if (now - lastPlotMs < MIN_SAMPLE_GAP_MS) return;
+  lastPlotMs = now;
+
+  chart.data.datasets.forEach((ds, i) => {
+    const key = SERIES[i].key;
+    if (values[key] !== undefined) ds.data.push({ x: now, y: values[key] });
+  });
+
+  pruneOld();
+  chart.options.scales.x.min = now - WINDOW_MS;
+  chart.options.scales.x.max = now;
+  chart.update('none');
+}
+
+// ---------------- Web Serial wiring ----------------
+let port, reader, keepReading = false;
+const connectBtn = document.getElementById('connectBtn');
+const clearBtn = document.getElementById('clearBtn');
+const dot = document.getElementById('dot');
+const statusText = document.getElementById('statusText');
+const baudSel = document.getElementById('baud');
+
+function setConnectedUi(connected) {
+  dot.classList.toggle('live', connected);
+  statusText.textContent = connected ? 'Streaming' : 'Not connected';
+  connectBtn.textContent = connected ? 'Disconnect' : 'Connect';
+  clearBtn.disabled = !connected;
+}
+
+async function connect() {
+  if (!('serial' in navigator)) {
+    alert('Web Serial API is not available. Use Chrome or Edge on desktop.');
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: parseInt(baudSel.value, 10) });
+    keepReading = true;
+    setConnectedUi(true);
+    readLoop();
+  } catch (err) {
+    console.error(err);
+    statusText.textContent = 'Connection failed';
+  }
+}
+
+async function disconnect() {
+  keepReading = false;
+  try { if (reader) { await reader.cancel(); } } catch (e) {}
+  try { if (port) { await port.close(); } } catch (e) {}
+  setConnectedUi(false);
+}
+
+async function readLoop() {
+  const decoder = new TextDecoderStream();
+  const readableClosed = port.readable.pipeTo(decoder.writable);
+  reader = decoder.readable.getReader();
+  let buf = '';
+
+  try {
+    while (keepReading) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        buf += value;
+        let idx;
+        while ((idx = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, idx);
+          buf = buf.slice(idx + 1);
+          ingestLine(line);
+        }
+      }
+    }
+  } catch (err) {
+    console.error(err);
+  } finally {
+    reader.releaseLock();
+    try { await readableClosed.catch(() => {}); } catch (e) {}
+  }
+}
+
+connectBtn.addEventListener('click', () => {
+  if (dot.classList.contains('live')) disconnect();
+  else connect();
+});
+
+clearBtn.addEventListener('click', () => {
+  chart.data.datasets.forEach(ds => ds.data = []);
+  chart.update('none');
+});
+
+// keep the moving window ticking even if data is sparse
+setInterval(() => {
+  if (!dot.classList.contains('live')) return;
+  const now = Date.now();
+  pruneOld();
+  chart.options.scales.x.min = now - WINDOW_MS;
+  chart.options.scales.x.max = now;
+  chart.update('none');
+}, 5000);
+</script>
+</body>
+</html>
